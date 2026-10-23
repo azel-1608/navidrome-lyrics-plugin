@@ -53,6 +53,29 @@ Some of the providers don't host lyrics themselves, they pull them from other we
 | stixoi.info |                                                                       | plain                | Greek lyrics                                                         |
 | Genie Music |                                                                       | lrc                  | Korean lyrics                                                        |
 | BiniLyrics  |                                                                       | ttml                 |                                                                      |
+| BiniLyrics (romanized) |                                                             | ttml                 | Puts romanization in the translation track for clients that ignore pronunciation (e.g. Symfonium) |
+
+### Romanization as translation
+
+Some clients, such as Symfonium, only display the main lyrics and a translation
+track. They ignore OpenSubsonic `pronunciation`/transliteration tracks, so the
+romanization in BiniLyrics TTML would otherwise be invisible.
+
+The `binilyrics-romanized` provider is a variant of `binilyrics` that moves the
+romanization into the translation track and removes the original English
+translation when romanization is available. Select it as the first provider to
+show romanized Korean/Japanese lyrics in those clients. Use the regular
+`binilyrics` provider if you want the normal translation instead.
+
+To let the plugin take precedence over lyrics embedded in the audio file, place
+`nd-lyrics` before `embedded` in Navidrome's `LyricsPriority`:
+
+```toml
+LyricsPriority = ".ttml,.elrc,.lrc,.srt,.txt,nd-lyrics,embedded"
+```
+
+Local sidecar files still win when they appear before `nd-lyrics`; embedded
+lyrics remain as the final fallback when the plugin has no result.
 
 ## Provider modes
 

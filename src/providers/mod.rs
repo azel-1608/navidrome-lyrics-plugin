@@ -38,6 +38,7 @@ pub fn register_providers(registry: &mut ProviderRegistry) {
     registry.register("stixoi", Stixoi::create);
     registry.register("genie", Genie::create);
     registry.register("binilyrics", BiniLyrics::create);
+    registry.register("binilyrics-romanized", BiniLyrics::create_romanized);
 }
 
 pub trait LyricsProvider {

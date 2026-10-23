@@ -1,7 +1,7 @@
 {
   "name": "Lyrics",
   "author": "Jorge Pardo",
-  "version": "8.1.0",
+  "version": "8.1.1",
   "description": "Fetch lyrics from multiple sources",
   "website": "https://github.com/J0R6IT0/navidrome-lyrics-plugin",
 
@@ -83,7 +83,11 @@
                   { "const": "applemusic", "title": "Apple Music" },
                   { "const": "stixoi", "title": "stixoi.info" },
                   { "const": "genie", "title": "Genie Music" },
-                  { "const": "binilyrics", "title": "BiniLyrics" }
+                  { "const": "binilyrics", "title": "BiniLyrics" },
+                  {
+                    "const": "binilyrics-romanized",
+                    "title": "BiniLyrics (romanization as translation)"
+                  }
                 ]
               },
               "baseUrl": {
