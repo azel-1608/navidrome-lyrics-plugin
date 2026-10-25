@@ -63,9 +63,10 @@ romanization in BiniLyrics TTML would otherwise be invisible.
 
 The `binilyrics-romanized` provider is a variant of `binilyrics` that moves the
 romanization into the translation track and removes the original English
-translation when romanization is available. Select it as the first provider to
-show romanized Korean/Japanese lyrics in those clients. Use the regular
-`binilyrics` provider if you want the normal translation instead.
+translation when romanization is available. Latin-only lines are omitted from
+that track because their transliteration is the English text itself. Select it
+as the first provider to show romanized Korean/Japanese lyrics in those clients.
+Use the regular `binilyrics` provider if you want the normal translation instead.
 
 BiniLyrics sometimes leaves trailing punctuation outside a timed span, for
 example `(Ooh</span>)`. Navidrome treats that orphan `)` as a gap for the main
