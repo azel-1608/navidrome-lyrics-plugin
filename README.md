@@ -67,6 +67,12 @@ translation when romanization is available. Select it as the first provider to
 show romanized Korean/Japanese lyrics in those clients. Use the regular
 `binilyrics` provider if you want the normal translation instead.
 
+BiniLyrics sometimes leaves trailing punctuation outside a timed span, for
+example `(Ooh</span>)`. Navidrome treats that orphan `)` as a gap for the main
+voice, which makes word-synced cue lines start with `)`. The romanized provider
+normalizes that punctuation into the preceding timed span before moving the
+romanization, so lines such as `(Ooh) eo ri...` keep their full cue text.
+
 To let the plugin take precedence over lyrics embedded in the audio file, place
 `nd-lyrics` before `embedded` in Navidrome's `LyricsPriority`:
 

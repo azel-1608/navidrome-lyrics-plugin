@@ -5,7 +5,9 @@ use crate::{
     types::{Lyrics, LyricsKind},
 };
 use nd_pdk::lyrics::TrackInfo;
+use regex::{Captures, Regex};
 use serde::Deserialize;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 const BASE_URL: &str = "https://lyrics-api.binimum.org";
@@ -176,6 +178,81 @@ fn retag_transliteration_as_translation(inner: &str) -> String {
         .replace("</transliteration>", "</translation>")
 }
 
+/// Matches a timed `<span>` whose text is immediately followed by punctuation
+/// outside the span. BiniLyrics sometimes emits background ad-libs as
+/// `(Ooh` inside the timed span and the closing `)` after `</span>`. Navidrome
+/// then treats that orphan `)` as a gap belonging to the main voice, which
+/// makes the cue line start with `)`.
+static TIMED_SPAN_WITH_TRAILING_PUNCT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?s)(<span\b[^>]*\b(?:begin|end|dur)="[^"]*"[^>]*>)([^<]*)(</span>)([)\]}.,!?;:…”’]+)"#,
+    )
+    .expect("valid trailing punctuation regex")
+});
+
+/// Moves trailing punctuation into the preceding timed span when possible.
+///
+/// Closing brackets are only moved when the span contains the matching opening
+/// bracket, so an already-balanced `(Ooh)</span>)` is left untouched. Other
+/// trailing punctuation is moved as long as the span has text; punctuation
+/// separated by whitespace is intentionally ignored by the regex.
+fn move_trailing_punctuation(text: &str, punctuation: &str) -> (String, String) {
+    if text.is_empty() {
+        return (String::new(), punctuation.to_owned());
+    }
+
+    let mut moved = String::new();
+    let mut remaining_start = 0;
+    let mut updated = text.to_owned();
+
+    for (index, ch) in punctuation.char_indices() {
+        let movable = match ch {
+            ')' => {
+                updated.matches('(').count() > updated.matches(')').count()
+                    || !updated.ends_with(')')
+            }
+            ']' => {
+                updated.matches('[').count() > updated.matches(']').count()
+                    || !updated.ends_with(']')
+            }
+            '}' => {
+                updated.matches('{').count() > updated.matches('}').count()
+                    || !updated.ends_with('}')
+            }
+            '”' => updated.matches('“').count() > updated.matches('”').count(),
+            '’' => updated.matches('‘').count() > updated.matches('’').count(),
+            _ => true,
+        };
+        if !movable {
+            break;
+        }
+
+        updated.push(ch);
+        moved.push(ch);
+        remaining_start = index + ch.len_utf8();
+    }
+
+    (moved, punctuation[remaining_start..].to_owned())
+}
+
+fn normalize_orphan_trailing_punctuation(ttml: &str) -> String {
+    TIMED_SPAN_WITH_TRAILING_PUNCT
+        .replace_all(ttml, |captures: &Captures<'_>| {
+            let text = &captures[2];
+            let punctuation = &captures[4];
+            let (moved, remaining) = move_trailing_punctuation(text, punctuation);
+            if moved.is_empty() {
+                captures[0].to_owned()
+            } else {
+                format!(
+                    "{}{}{}{}{}",
+                    &captures[1], text, moved, &captures[3], remaining
+                )
+            }
+        })
+        .into_owned()
+}
+
 /// Rewrites BiniLyrics TTML so clients that only understand `translation`
 /// tracks receive the romanization instead of the English translation.
 ///
@@ -192,9 +269,10 @@ fn move_romanization_to_translation(text: &str) -> String {
         return text.to_owned();
     }
 
+    let romanization = normalize_orphan_trailing_punctuation(romanization);
     let replacement = format!(
         "<translations>{}</translations>",
-        retag_transliteration_as_translation(romanization)
+        retag_transliteration_as_translation(&romanization)
     );
 
     match find_block(text, "translations") {
@@ -269,6 +347,84 @@ mod tests {
             r#"<translations><translation xml:lang="ko-Latn"><text for="L1">annyeong</text></translation></translations>"#
         ));
         assert!(!output.contains("transliterations"));
+    }
+
+    #[test]
+    fn folds_orphan_closing_parentheses_into_timed_spans() {
+        let input = concat!(
+            r#"<tt><sourceMetadata><translations><translation xml:lang="en-US">"#,
+            r#"<text for="L1">Hello</text></translation></translations>"#,
+            r#"<transliterations><transliteration xml:lang="ko-Latn">"#,
+            r#"<text for="L1"><span ttm:role="x-bg"><span begin="9.111" end="9.500">(Ooh</span>)</span> "#,
+            r#"<span begin="9.400" end="10.096">eo ri</span> "#,
+            r#"<span ttm:role="x-bg"><span begin="20.000" end="20.500">(Yeah</span>)</span> "#,
+            r#"<span begin="20.400" end="21.000">mal hae</span> "#,
+            r#"<span ttm:role="x-bg"><span begin="30.000" end="30.500">(eo kkae</span>)</span> "#,
+            r#"<span begin="30.400" end="31.000">sok</span> "#,
+            r#"<span ttm:role="x-bg"><span begin="40.000" end="40.500">(som ssi e</span>)</span> "#,
+            r#"<span begin="40.400" end="41.000">da</span></text>"#,
+            r#"</transliteration></transliterations></sourceMetadata></tt>"#
+        );
+
+        let output = move_romanization_to_translation(input);
+
+        assert!(output.contains(r#"<span begin="9.111" end="9.500">(Ooh)</span>"#));
+        assert!(output.contains(r#"<span begin="20.000" end="20.500">(Yeah)</span>"#));
+        assert!(output.contains(r#"<span begin="30.000" end="30.500">(eo kkae)</span>"#));
+        assert!(output.contains(r#"<span begin="40.000" end="40.500">(som ssi e)</span>"#));
+        assert!(!output.contains("(Ooh</span>)"));
+        assert!(!output.contains("(Yeah</span>)"));
+        assert!(!output.contains("(eo kkae</span>)"));
+        assert!(!output.contains("(som ssi e</span>)"));
+    }
+
+    #[test]
+    fn folds_trailing_punctuation_but_not_whitespace_separated_punctuation() {
+        let input = concat!(
+            r#"<tt><translations><translation xml:lang="en-US">"#,
+            r#"<text for="L1">Hello</text></translation></translations>"#,
+            r#"<transliterations><transliteration xml:lang="ko-Latn">"#,
+            r#"<text for="L1"><span begin="1.000" end="2.000">word</span>, next "#,
+            r#"<span begin="3.000" end="4.000">line</span> !</text>"#,
+            r#"</transliteration></transliterations></tt>"#
+        );
+
+        let output = move_romanization_to_translation(input);
+
+        assert!(output.contains(r#"<span begin="1.000" end="2.000">word,</span>"#));
+        assert!(output.contains(r#"<span begin="3.000" end="4.000">line</span> !"#));
+    }
+
+    #[test]
+    fn folds_a_closing_parenthesis_when_the_opening_is_outside_the_span() {
+        let input = concat!(
+            r#"<tt><translations><translation xml:lang="en-US">"#,
+            r#"<text for="L1">Hello</text></translation></translations>"#,
+            r#"<transliterations><transliteration xml:lang="ko-Latn">"#,
+            r#"<text for="L1">(<span begin="1.000" end="2.000">Ooh</span>)</text>"#,
+            r#"</transliteration></transliterations></tt>"#
+        );
+
+        let output = move_romanization_to_translation(input);
+
+        assert!(output.contains(r#"<span begin="1.000" end="2.000">Ooh)</span>"#));
+        assert!(!output.contains(r#"<span begin="1.000" end="2.000">Ooh</span>)"#));
+    }
+
+    #[test]
+    fn does_not_add_an_extra_closing_parenthesis_when_already_balanced() {
+        let input = concat!(
+            r#"<tt><translations><translation xml:lang="en-US">"#,
+            r#"<text for="L1">Hello</text></translation></translations>"#,
+            r#"<transliterations><transliteration xml:lang="ko-Latn">"#,
+            r#"<text for="L1"><span begin="1.000" end="2.000">(Ooh)</span>)</text>"#,
+            r#"</transliteration></transliterations></tt>"#
+        );
+
+        let output = move_romanization_to_translation(input);
+
+        assert!(output.contains(r#"(Ooh)</span>)"#));
+        assert!(!output.contains(r#"(Ooh))</span>"#));
     }
 
     #[test]
