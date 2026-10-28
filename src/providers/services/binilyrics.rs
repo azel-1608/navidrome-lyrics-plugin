@@ -67,10 +67,7 @@ impl BiniLyrics {
     }
 
     fn search(&self, track: &TrackInfo) -> ProviderResult<Vec<Record>> {
-        let query = match track.first_artist() {
-            Some(artist) => format!("{} {}", artist, track.clean_title()),
-            None => track.clean_title(),
-        };
+        let query = search_query(track);
 
         let response = Http::get(BASE_URL).param("q", query).send()?;
 
@@ -133,6 +130,28 @@ fn matches(track: &TrackInfo, cfg: &PluginConfig, record: &Record) -> bool {
     record.duration.is_some_and(|d| {
         track.matches_duration(Duration::from_secs(d.into()), cfg.duration_tolerance)
     }) && (!cfg.require_album_match || track.matches_album(&record.album_name))
+}
+
+/// BiniLyrics treats apostrophes as significant in its search index, so a
+/// title such as `they don’t know ’bout us` returns no results even though the
+/// song exists. Drop quote characters from the query; the duration check still
+/// rejects unrelated matches.
+fn normalize_search_term(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !matches!(ch, '\'' | '’' | '‘' | '`' | '´' | '"' | '“' | '”'))
+        .collect()
+}
+
+fn search_query(track: &TrackInfo) -> String {
+    match track.first_artist() {
+        Some(artist) => format!(
+            "{} {}",
+            normalize_search_term(artist),
+            normalize_search_term(&track.clean_title())
+        ),
+        None => normalize_search_term(&track.clean_title()),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -645,5 +664,17 @@ mod tests {
 
         assert!(output.contains(r#"(Ooh)</span>)"#));
         assert!(!output.contains(r#"(Ooh))</span>"#));
+    }
+
+    #[test]
+    fn search_queries_ignore_apostrophes() {
+        let track = TrackInfo {
+            title: "they don’t know ’bout us".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(search_query(&track), "they dont know bout us");
+        assert_eq!(normalize_search_term("“Quoted”"), "Quoted");
+        assert_eq!(normalize_search_term("BTS"), "BTS");
     }
 }
