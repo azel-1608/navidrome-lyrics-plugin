@@ -53,26 +53,23 @@ Some of the providers don't host lyrics themselves, they pull them from other we
 | stixoi.info |                                                                       | plain                | Greek lyrics                                                         |
 | Genie Music |                                                                       | lrc                  | Korean lyrics                                                        |
 | BiniLyrics  |                                                                       | ttml                 |                                                                      |
-| BiniLyrics (romanized) |                                                             | ttml                 | Puts romanization in the translation track for clients that ignore pronunciation (e.g. Symfonium) |
+| BiniLyrics (romanized) |                                                             | ttml                 | Replaces Hangul/kana/Han in the main lyrics with romanization for clients that only show the main track |
 
-### Romanization as translation
+### Romanized main lyrics
 
-Some clients, such as Symfonium, only display the main lyrics and a translation
-track. They ignore OpenSubsonic `pronunciation`/transliteration tracks, so the
-romanization in BiniLyrics TTML would otherwise be invisible.
-
-The `binilyrics-romanized` provider is a variant of `binilyrics` that moves the
-romanization into the translation track and removes the original English
-translation when romanization is available. Latin-only lines are omitted from
-that track because their transliteration is the English text itself. Select it
+Some clients, such as Symfonium, only display the main lyric track. The
+`binilyrics-romanized` provider is a variant of `binilyrics` that replaces the
+original Hangul, kana, or Han text in each main lyric line with its romanization.
+English-only lines keep their original text. The translation and
+transliteration blocks are removed, so no secondary track is shown. Select it
 as the first provider to show romanized Korean/Japanese lyrics in those clients.
 Use the regular `binilyrics` provider if you want the normal translation instead.
 
 BiniLyrics sometimes leaves trailing punctuation outside a timed span, for
 example `(Ooh</span>)`. Navidrome treats that orphan `)` as a gap for the main
 voice, which makes word-synced cue lines start with `)`. The romanized provider
-normalizes that punctuation into the preceding timed span before moving the
-romanization, so lines such as `(Ooh) eo ri...` keep their full cue text.
+normalizes that punctuation into the preceding timed span before replacing the
+main lyric text, so lines such as `(Ooh) eo ri...` keep their full cue text.
 
 To let the plugin take precedence over lyrics embedded in the audio file, place
 `nd-lyrics` before `embedded` in Navidrome's `LyricsPriority`:

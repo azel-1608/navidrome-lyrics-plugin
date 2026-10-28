@@ -28,22 +28,22 @@ struct Record {
 }
 
 pub struct BiniLyrics {
-    romanization_as_translation: bool,
+    romanization_as_main: bool,
 }
 
 impl BiniLyrics {
     pub fn create(_: &ProviderParams) -> Box<dyn LyricsProvider> {
         Box::new(Self {
-            romanization_as_translation: false,
+            romanization_as_main: false,
         })
     }
 
-    /// Variant for clients, such as Symfonium, that only expose the
-    /// `translation` lyric track. The romanization is moved into that track so
-    /// it is visible, while the original translation is discarded.
+    /// Variant for clients that display only the main lyric track. Romanization
+    /// replaces the original Hangul, kana, or Han text in the main track, and
+    /// the translation/transliteration blocks are removed.
     pub fn create_romanized(_: &ProviderParams) -> Box<dyn LyricsProvider> {
         Box::new(Self {
-            romanization_as_translation: true,
+            romanization_as_main: true,
         })
     }
 
@@ -88,8 +88,8 @@ impl BiniLyrics {
         match response.status {
             200 => {
                 let text = response.text();
-                let text = if self.romanization_as_translation {
-                    move_romanization_to_translation(&text)
+                let text = if self.romanization_as_main {
+                    move_romanization_to_main(&text)
                 } else {
                     text.into_owned()
                 };
@@ -172,12 +172,6 @@ fn find_block(text: &str, name: &str) -> Option<Block> {
     None
 }
 
-fn retag_transliteration_as_translation(inner: &str) -> String {
-    inner
-        .replace("<transliteration", "<translation")
-        .replace("</transliteration>", "</translation>")
-}
-
 static MAIN_PARAGRAPH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)<p\b([^>]*)>(.*?)</p\s*>"#).expect("valid main paragraph regex")
 });
@@ -198,25 +192,27 @@ static FOR_ATTRIBUTE: LazyLock<Regex> = LazyLock::new(|| {
 static XML_TAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?s)<[^>]*>"#).expect("valid XML tag regex"));
 
-/// Maps each main lyric line key to whether its text contains a CJK script.
+/// Maps each transliteration key to its inner TTML.
 ///
-/// BiniLyrics uses `lrc:key`, `itunes:key`, or `key` on `<p>` elements. The
-/// parser matches the local attribute name so all three forms work.
-fn main_line_needs_romanization(ttml: &str) -> HashMap<String, bool> {
-    let mut lines = HashMap::new();
+/// Entries without a key or with empty content are skipped. The first entry
+/// wins when a key appears more than once.
+fn transliteration_entries(romanization: &str) -> HashMap<String, String> {
+    let mut entries = HashMap::new();
 
-    for captures in MAIN_PARAGRAPH.captures_iter(ttml) {
-        let Some(key) = attribute_value(&KEY_ATTRIBUTE, &captures[1]) else {
+    for captures in TEXT_ELEMENT.captures_iter(romanization) {
+        let Some(key) = attribute_value(&FOR_ATTRIBUTE, &captures[1]) else {
             continue;
         };
-
-        let text = XML_TAG.replace_all(&captures[2], "");
-        lines
+        let inner = &captures[2];
+        if inner.trim().is_empty() {
+            continue;
+        }
+        entries
             .entry(key.to_owned())
-            .or_insert_with(|| has_cjk_script(&text));
+            .or_insert_with(|| inner.to_owned());
     }
 
-    lines
+    entries
 }
 
 fn attribute_value<'a>(pattern: &Regex, attributes: &'a str) -> Option<&'a str> {
@@ -225,27 +221,6 @@ fn attribute_value<'a>(pattern: &Regex, attributes: &'a str) -> Option<&'a str> 
         .and_then(|captures| captures.get(1))
         .map(|value| value.as_str().trim())
         .filter(|value| !value.is_empty())
-}
-
-/// Keeps romanization only for lines whose main text contains Hangul, kana, or
-/// Han characters. Latin-only lines are already readable, so repeating them in
-/// the translation track is noise for clients such as Symfonium.
-fn filter_latin_only_romanization(
-    romanization: &str,
-    main_lines: &HashMap<String, bool>,
-) -> String {
-    TEXT_ELEMENT
-        .replace_all(romanization, |captures: &Captures<'_>| {
-            let Some(key) = attribute_value(&FOR_ATTRIBUTE, &captures[1]) else {
-                return captures[0].to_owned();
-            };
-
-            match main_lines.get(key) {
-                Some(false) => String::new(),
-                _ => captures[0].to_owned(),
-            }
-        })
-        .into_owned()
 }
 
 fn has_cjk_script(text: &str) -> bool {
@@ -352,14 +327,15 @@ fn normalize_orphan_trailing_punctuation(ttml: &str) -> String {
         .into_owned()
 }
 
-/// Rewrites BiniLyrics TTML so clients that only understand `translation`
-/// tracks receive the romanization instead of the English translation.
+/// Rewrites BiniLyrics TTML so the main lyric track contains romanization.
 ///
-/// The original `<translations>` block is replaced, and the now-redundant
-/// `<transliterations>` block is removed. Latin-only lines are omitted from the
-/// romanization track because the transliteration of English is the English
-/// text itself. If there is no romanization, the document is returned unchanged.
-fn move_romanization_to_translation(text: &str) -> String {
+/// For each main `<p>` whose text contains Hangul, kana, or Han, the inner
+/// content is replaced with the matching `<text for="...">` entry from the
+/// `<transliterations>` block. Latin-only lines and lines without a matching
+/// transliteration entry keep their original text. The translation and
+/// transliteration blocks are removed so clients do not show a secondary
+/// track. If there is no romanization, the document is returned unchanged.
+fn move_romanization_to_main(text: &str) -> String {
     let Some(transliterations) = find_block(text, "transliterations") else {
         return text.to_owned();
     };
@@ -370,29 +346,35 @@ fn move_romanization_to_translation(text: &str) -> String {
     }
 
     let romanization = normalize_orphan_trailing_punctuation(romanization);
-    let main_lines = main_line_needs_romanization(text);
-    let romanization = filter_latin_only_romanization(&romanization, &main_lines);
-    let replacement = format!(
-        "<translations>{}</translations>",
-        retag_transliteration_as_translation(&romanization)
-    );
-
-    match find_block(text, "translations") {
-        Some(translations) => apply_edits(
-            text,
-            vec![
-                (translations.start, translations.end, replacement),
-                (transliterations.start, transliterations.end, String::new()),
-            ],
-        ),
-        None => {
-            let mut out = String::with_capacity(text.len() + replacement.len());
-            out.push_str(&text[..transliterations.start]);
-            out.push_str(&replacement);
-            out.push_str(&text[transliterations.end..]);
-            out
-        }
+    let entries = transliteration_entries(&romanization);
+    if entries.is_empty() {
+        return text.to_owned();
     }
+
+    let mut edits = Vec::new();
+    for captures in MAIN_PARAGRAPH.captures_iter(text) {
+        let Some(key) = attribute_value(&KEY_ATTRIBUTE, &captures[1]) else {
+            continue;
+        };
+
+        let main_text = XML_TAG.replace_all(&captures[2], "");
+        if !has_cjk_script(&main_text) {
+            continue;
+        }
+
+        let Some(romanization) = entries.get(key) else {
+            continue;
+        };
+        let content = captures.get(2).expect("main paragraph content capture");
+        edits.push((content.start(), content.end(), romanization.clone()));
+    }
+
+    if let Some(translations) = find_block(text, "translations") {
+        edits.push((translations.start, translations.end, String::new()));
+    }
+    edits.push((transliterations.start, transliterations.end, String::new()));
+
+    apply_edits(text, edits)
 }
 
 fn apply_edits(text: &str, mut edits: Vec<(usize, usize, String)>) -> String {
@@ -417,58 +399,210 @@ mod tests {
     use super::*;
 
     #[test]
-    fn moves_romanization_into_the_translation_track() {
+    fn moves_romanization_into_the_main_track() {
         let input = concat!(
-            r#"<tt><sourceMetadata><translations><translation xml:lang="en-US">"#,
+            r#"<tt><head><metadata>"#,
+            r#"<translations><translation xml:lang="en-US">"#,
             r#"<text for="L1">Hello</text></translation></translations>"#,
             r#"<transliterations><transliteration xml:lang="ko-Latn">"#,
             r#"<text for="L1">annyeong</text></transliteration></transliterations>"#,
-            r#"</sourceMetadata></tt>"#
+            r#"</metadata></head><body>"#,
+            r#"<p begin="1.000" end="2.000" lrc:key="L1">안녕</p>"#,
+            r#"</body></tt>"#
         );
 
-        let output = move_romanization_to_translation(input);
+        let output = move_romanization_to_main(input);
 
-        assert!(output.contains(
-            r#"<translations><translation xml:lang="ko-Latn"><text for="L1">annyeong</text></translation></translations>"#
-        ));
-        assert!(!output.contains("transliterations"));
+        assert!(output.contains(r#"<p begin="1.000" end="2.000" lrc:key="L1">annyeong</p>"#));
         assert!(!output.contains("Hello"));
+        assert!(!output.contains("안녕"));
+        assert!(!output.contains("<translations"));
+        assert!(!output.contains("<transliterations"));
     }
 
     #[test]
-    fn creates_a_translation_track_when_there_was_none() {
+    fn keeps_latin_only_main_lines_unchanged() {
         let input = concat!(
-            r#"<tt><sourceMetadata><transliterations><transliteration xml:lang="ko-Latn">"#,
-            r#"<text for="L1">annyeong</text></transliteration></transliterations>"#,
+            r#"<tt><head><metadata>"#,
+            r#"<transliterations><transliteration xml:lang="ko-Latn">"#,
+            r#"<text for="L1">annyeong</text>"#,
+            r#"<text for="L2">Hello world!</text>"#,
+            r#"</transliteration></transliterations>"#,
+            r#"</metadata></head><body>"#,
+            r#"<p begin="1" end="2" key="L1">안녕</p>"#,
+            r#"<p begin="2" end="3" key="L2">Hello world</p>"#,
+            r#"</body></tt>"#
+        );
+
+        let output = move_romanization_to_main(input);
+
+        assert!(output.contains(r#"<p begin="1" end="2" key="L1">annyeong</p>"#));
+        assert!(output.contains(r#"<p begin="2" end="3" key="L2">Hello world</p>"#));
+        assert!(!output.contains("Hello world!"));
+    }
+
+    #[test]
+    fn keeps_main_text_when_romanization_is_missing() {
+        let input = concat!(
+            r#"<tt><head><metadata>"#,
+            r#"<transliterations><transliteration xml:lang="ja-Latn">"#,
+            r#"<text for="L1">konnichiwa</text>"#,
+            r#"</transliteration></transliterations>"#,
+            r#"</metadata></head><body>"#,
+            r#"<p begin="1" end="2" key="L1">こんにちは</p>"#,
+            r#"<p begin="2" end="3" key="L2">漢字</p>"#,
+            r#"</body></tt>"#
+        );
+
+        let output = move_romanization_to_main(input);
+
+        assert!(output.contains(r#"<p begin="1" end="2" key="L1">konnichiwa</p>"#));
+        assert!(output.contains(r#"<p begin="2" end="3" key="L2">漢字</p>"#));
+        assert!(!output.contains("<transliterations"));
+    }
+
+    #[test]
+    fn replaces_mixed_lines_using_itunes_keys() {
+        let input = concat!(
+            r#"<tt><head><metadata>"#,
+            r#"<transliterations><transliteration xml:lang="ko-Latn">"#,
+            r#"<text for="L1">annyeong Hello</text>"#,
+            r#"</transliteration></transliterations>"#,
+            r#"</metadata></head><body>"#,
+            r#"<p begin="1" end="2" itunes:key="L1">안녕 Hello</p>"#,
+            r#"</body></tt>"#
+        );
+
+        let output = move_romanization_to_main(input);
+
+        assert!(output.contains(r#"<p begin="1" end="2" itunes:key="L1">annyeong Hello</p>"#));
+        assert!(!output.contains("안녕"));
+    }
+
+    #[test]
+    fn keeps_unknown_transliteration_keys_out_of_the_main_track() {
+        let input = concat!(
+            r#"<tt><head><metadata>"#,
+            r#"<transliterations><transliteration xml:lang="ko-Latn">"#,
+            r#"<text for="L9">unknown</text>"#,
+            r#"</transliteration></transliterations>"#,
+            r#"</metadata></head><body>"#,
+            r#"<p begin="1" end="2" key="L1">안녕</p>"#,
+            r#"</body></tt>"#
+        );
+
+        let output = move_romanization_to_main(input);
+
+        assert!(output.contains(r#"<p begin="1" end="2" key="L1">안녕</p>"#));
+        assert!(!output.contains("unknown"));
+        assert!(!output.contains("<transliterations"));
+    }
+
+    #[test]
+    fn removes_blocks_for_all_latin_songs() {
+        let input = concat!(
+            r#"<tt><head><metadata>"#,
+            r#"<translations><translation xml:lang="en-US">"#,
+            r#"<text for="L1">Hello</text></translation></translations>"#,
+            r#"<transliterations><transliteration xml:lang="ko-Latn">"#,
+            r#"<text for="L1">Hello</text></transliteration></transliterations>"#,
+            r#"</metadata></head><body>"#,
+            r#"<p begin="1" end="2" key="L1">Hello</p>"#,
+            r#"</body></tt>"#
+        );
+
+        let output = move_romanization_to_main(input);
+
+        assert!(output.contains(r#"<p begin="1" end="2" key="L1">Hello</p>"#));
+        assert!(!output.contains("<translations"));
+        assert!(!output.contains("<transliterations"));
+    }
+
+    #[test]
+    fn leaves_documents_without_romanization_unchanged() {
+        let input = concat!(
+            r#"<tt><sourceMetadata><translations><translation xml:lang="en-US">"#,
+            r#"<text for="L1">Hello</text></translation></translations>"#,
             r#"</sourceMetadata></tt>"#
         );
 
-        let output = move_romanization_to_translation(input);
+        assert_eq!(move_romanization_to_main(input), input);
+    }
 
-        assert!(output.contains(
-            r#"<translations><translation xml:lang="ko-Latn"><text for="L1">annyeong</text></translation></translations>"#
-        ));
-        assert!(!output.contains("transliterations"));
+    #[test]
+    fn tolerates_attributes_on_the_container_tags() {
+        let input = concat!(
+            r#"<tt><translations xml:lang="en-US"><translation xml:lang="en-US">"#,
+            r#"<text for="L1">Hello</text></translation></translations>"#,
+            r#"<transliterations xml:lang="ko-Latn"><transliteration xml:lang="ko-Latn">"#,
+            r#"<text for="L1">annyeong</text></transliteration></transliterations>"#,
+            r#"<body><p key="L1">안녕</p></body></tt>"#
+        );
+
+        let output = move_romanization_to_main(input);
+
+        assert!(output.contains(r#"<p key="L1">annyeong</p>"#));
+        assert!(!output.contains("<translations"));
+        assert!(!output.contains("<transliterations"));
+    }
+
+    #[test]
+    fn handles_transliteration_blocks_before_translation_blocks() {
+        let input = concat!(
+            r#"<tt><transliterations><transliteration xml:lang="ko-Latn">"#,
+            r#"<text for="L1">annyeong</text></transliteration></transliterations>"#,
+            r#"<translations><translation xml:lang="en-US">"#,
+            r#"<text for="L1">Hello</text></translation></translations>"#,
+            r#"<body><p key="L1">안녕</p></body></tt>"#
+        );
+
+        let output = move_romanization_to_main(input);
+
+        assert!(output.contains(r#"<p key="L1">annyeong</p>"#));
+        assert!(!output.contains("Hello"));
+        assert!(!output.contains("<translations"));
+        assert!(!output.contains("<transliterations"));
+    }
+
+    #[test]
+    fn folds_orphan_closing_parentheses_before_replacing_main_text() {
+        let input = concat!(
+            r#"<tt><head><metadata>"#,
+            r#"<translations><translation xml:lang="en-US">"#,
+            r#"<text for="L1">Hello</text></translation></translations>"#,
+            r#"<transliterations><transliteration xml:lang="ko-Latn">"#,
+            r#"<text for="L1"><span ttm:role="x-bg"><span begin="9.111" end="9.500">(Ooh</span>)</span> "#,
+            r#"<span begin="9.400" end="10.096">eo ri</span></text>"#,
+            r#"</transliteration></transliterations>"#,
+            r#"</metadata></head><body>"#,
+            r#"<p begin="9.111" end="11.303" lrc:key="L1">"#,
+            r#"<span ttm:role="x-bg"><span begin="9.111" end="9.500">(Ooh)</span></span> "#,
+            r#"<span begin="9.400" end="10.096">어리숙하다</span></p>"#,
+            r#"</body></tt>"#
+        );
+
+        let output = move_romanization_to_main(input);
+
+        assert!(output.contains(r#"<span begin="9.111" end="9.500">(Ooh)</span>"#));
+        assert!(output.contains(r#"<span begin="9.400" end="10.096">eo ri</span>"#));
+        assert!(!output.contains("(Ooh</span>)"));
+        assert!(!output.contains("어리숙하다"));
     }
 
     #[test]
     fn folds_orphan_closing_parentheses_into_timed_spans() {
         let input = concat!(
-            r#"<tt><sourceMetadata><translations><translation xml:lang="en-US">"#,
-            r#"<text for="L1">Hello</text></translation></translations>"#,
-            r#"<transliterations><transliteration xml:lang="ko-Latn">"#,
-            r#"<text for="L1"><span ttm:role="x-bg"><span begin="9.111" end="9.500">(Ooh</span>)</span> "#,
+            r#"<span ttm:role="x-bg"><span begin="9.111" end="9.500">(Ooh</span>)</span> "#,
             r#"<span begin="9.400" end="10.096">eo ri</span> "#,
             r#"<span ttm:role="x-bg"><span begin="20.000" end="20.500">(Yeah</span>)</span> "#,
             r#"<span begin="20.400" end="21.000">mal hae</span> "#,
             r#"<span ttm:role="x-bg"><span begin="30.000" end="30.500">(eo kkae</span>)</span> "#,
             r#"<span begin="30.400" end="31.000">sok</span> "#,
             r#"<span ttm:role="x-bg"><span begin="40.000" end="40.500">(som ssi e</span>)</span> "#,
-            r#"<span begin="40.400" end="41.000">da</span></text>"#,
-            r#"</transliteration></transliterations></sourceMetadata></tt>"#
+            r#"<span begin="40.400" end="41.000">da</span>"#
         );
 
-        let output = move_romanization_to_translation(input);
+        let output = normalize_orphan_trailing_punctuation(input);
 
         assert!(output.contains(r#"<span begin="9.111" end="9.500">(Ooh)</span>"#));
         assert!(output.contains(r#"<span begin="20.000" end="20.500">(Yeah)</span>"#));
@@ -483,15 +617,11 @@ mod tests {
     #[test]
     fn folds_trailing_punctuation_but_not_whitespace_separated_punctuation() {
         let input = concat!(
-            r#"<tt><translations><translation xml:lang="en-US">"#,
-            r#"<text for="L1">Hello</text></translation></translations>"#,
-            r#"<transliterations><transliteration xml:lang="ko-Latn">"#,
-            r#"<text for="L1"><span begin="1.000" end="2.000">word</span>, next "#,
-            r#"<span begin="3.000" end="4.000">line</span> !</text>"#,
-            r#"</transliteration></transliterations></tt>"#
+            r#"<span begin="1.000" end="2.000">word</span>, next "#,
+            r#"<span begin="3.000" end="4.000">line</span> !"#
         );
 
-        let output = move_romanization_to_translation(input);
+        let output = normalize_orphan_trailing_punctuation(input);
 
         assert!(output.contains(r#"<span begin="1.000" end="2.000">word,</span>"#));
         assert!(output.contains(r#"<span begin="3.000" end="4.000">line</span> !"#));
@@ -499,15 +629,9 @@ mod tests {
 
     #[test]
     fn folds_a_closing_parenthesis_when_the_opening_is_outside_the_span() {
-        let input = concat!(
-            r#"<tt><translations><translation xml:lang="en-US">"#,
-            r#"<text for="L1">Hello</text></translation></translations>"#,
-            r#"<transliterations><transliteration xml:lang="ko-Latn">"#,
-            r#"<text for="L1">(<span begin="1.000" end="2.000">Ooh</span>)</text>"#,
-            r#"</transliteration></transliterations></tt>"#
-        );
+        let input = r#"<span begin="1.000" end="2.000">Ooh</span>)"#;
 
-        let output = move_romanization_to_translation(input);
+        let output = normalize_orphan_trailing_punctuation(input);
 
         assert!(output.contains(r#"<span begin="1.000" end="2.000">Ooh)</span>"#));
         assert!(!output.contains(r#"<span begin="1.000" end="2.000">Ooh</span>)"#));
@@ -515,176 +639,11 @@ mod tests {
 
     #[test]
     fn does_not_add_an_extra_closing_parenthesis_when_already_balanced() {
-        let input = concat!(
-            r#"<tt><translations><translation xml:lang="en-US">"#,
-            r#"<text for="L1">Hello</text></translation></translations>"#,
-            r#"<transliterations><transliteration xml:lang="ko-Latn">"#,
-            r#"<text for="L1"><span begin="1.000" end="2.000">(Ooh)</span>)</text>"#,
-            r#"</transliteration></transliterations></tt>"#
-        );
+        let input = r#"<span begin="1.000" end="2.000">(Ooh)</span>)"#;
 
-        let output = move_romanization_to_translation(input);
+        let output = normalize_orphan_trailing_punctuation(input);
 
         assert!(output.contains(r#"(Ooh)</span>)"#));
         assert!(!output.contains(r#"(Ooh))</span>"#));
-    }
-
-    #[test]
-    fn leaves_documents_without_romanization_unchanged() {
-        let input = concat!(
-            r#"<tt><sourceMetadata><translations><translation xml:lang="en-US">"#,
-            r#"<text for="L1">Hello</text></translation></translations>"#,
-            r#"</sourceMetadata></tt>"#
-        );
-
-        assert_eq!(move_romanization_to_translation(input), input);
-    }
-
-    #[test]
-    fn tolerates_attributes_on_the_container_tags() {
-        let input = concat!(
-            r#"<tt><translations xml:lang="en-US"><translation xml:lang="en-US">"#,
-            r#"<text for="L1">Hello</text></translation></translations>"#,
-            r#"<transliterations xml:lang="ko-Latn"><transliteration xml:lang="ko-Latn">"#,
-            r#"<text for="L1">annyeong</text></transliteration></transliterations></tt>"#
-        );
-
-        let output = move_romanization_to_translation(input);
-
-        assert!(output.contains(
-            r#"<translations><translation xml:lang="ko-Latn"><text for="L1">annyeong</text></translation></translations>"#
-        ));
-        assert!(!output.contains("transliterations"));
-    }
-
-    #[test]
-    fn handles_romanization_blocks_before_translation_blocks() {
-        let input = concat!(
-            r#"<tt><transliterations><transliteration xml:lang="ko-Latn">"#,
-            r#"<text for="L1">annyeong</text></transliteration></transliterations>"#,
-            r#"<translations><translation xml:lang="en-US">"#,
-            r#"<text for="L1">Hello</text></translation></translations></tt>"#
-        );
-
-        let output = move_romanization_to_translation(input);
-
-        assert!(output.contains(
-            r#"<translations><translation xml:lang="ko-Latn"><text for="L1">annyeong</text></translation></translations>"#
-        ));
-        assert!(!output.contains("transliterations"));
-        assert!(!output.contains("Hello"));
-    }
-
-    #[test]
-    fn filters_latin_only_lines_using_lrc_keys() {
-        let input = concat!(
-            r#"<tt><body>"#,
-            r#"<p begin="1" end="2" lrc:key="L1">안녕하세요</p>"#,
-            r#"<p begin="2" end="3" lrc:key="L2">Hello world</p>"#,
-            r#"<p begin="3" end="4" lrc:key="L3">안녕 Hello</p>"#,
-            r#"</body><head><metadata>"#,
-            r#"<translations><translation xml:lang="en-US">"#,
-            r#"<text for="L1">Hello</text>"#,
-            r#"<text for="L2">Hello world</text>"#,
-            r#"<text for="L3">Hello Hello</text>"#,
-            r#"</translation></translations>"#,
-            r#"<transliterations><transliteration xml:lang="ko-Latn">"#,
-            r#"<text for="L1">annyeonghaseyo</text>"#,
-            r#"<text for="L2">Hello world</text>"#,
-            r#"<text for="L3">annyeong Hello</text>"#,
-            r#"</transliteration></transliterations>"#,
-            r#"</metadata></head></tt>"#
-        );
-
-        let output = move_romanization_to_translation(input);
-
-        assert!(output.contains(r#"<text for="L1">annyeonghaseyo</text>"#));
-        assert!(!output.contains(r#"<text for="L2">Hello world</text>"#));
-        assert!(output.contains(r#"<text for="L3">annyeong Hello</text>"#));
-        assert!(!output.contains("en-US"));
-        assert!(!output.contains("transliterations"));
-    }
-
-    #[test]
-    fn filters_latin_only_lines_using_itunes_keys() {
-        let input = concat!(
-            r#"<tt><body>"#,
-            r#"<p itunes:key="L1">こんにちは</p>"#,
-            r#"<p itunes:key="L2">漢字</p>"#,
-            r#"<p itunes:key="L3">Hello</p>"#,
-            r#"</body><head><metadata>"#,
-            r#"<transliterations><transliteration xml:lang="ja-Latn">"#,
-            r#"<text for="L1">konnichiwa</text>"#,
-            r#"<text for="L2">kanji</text>"#,
-            r#"<text for="L3">Hello</text>"#,
-            r#"</transliteration></transliterations>"#,
-            r#"</metadata></head></tt>"#
-        );
-
-        let output = move_romanization_to_translation(input);
-
-        assert!(output.contains(r#"<text for="L1">konnichiwa</text>"#));
-        assert!(output.contains(r#"<text for="L2">kanji</text>"#));
-        assert!(!output.contains(r#"<text for="L3">Hello</text>"#));
-    }
-
-    #[test]
-    fn keeps_transliteration_entries_without_a_matching_main_line() {
-        let input = concat!(
-            r#"<tt><body>"#,
-            r#"<p key="L1">안녕</p>"#,
-            r#"</body><head><metadata>"#,
-            r#"<transliterations><transliteration xml:lang="ko-Latn">"#,
-            r#"<text for="L1">annyeong</text>"#,
-            r#"<text for="L9">unknown</text>"#,
-            r#"</transliteration></transliterations>"#,
-            r#"</metadata></head></tt>"#
-        );
-
-        let output = move_romanization_to_translation(input);
-
-        assert!(output.contains(r#"<text for="L1">annyeong</text>"#));
-        assert!(output.contains(r#"<text for="L9">unknown</text>"#));
-    }
-
-    #[test]
-    fn drops_all_romanization_for_an_all_latin_song() {
-        let input = concat!(
-            r#"<tt><body>"#,
-            r#"<p key="L1">Hello</p>"#,
-            r#"<p key="L2">World</p>"#,
-            r#"</body><head><metadata>"#,
-            r#"<transliterations><transliteration xml:lang="ko-Latn">"#,
-            r#"<text for="L1">Hello</text>"#,
-            r#"<text for="L2">World</text>"#,
-            r#"</transliteration></transliterations>"#,
-            r#"</metadata></head></tt>"#
-        );
-
-        let output = move_romanization_to_translation(input);
-
-        assert!(!output.contains("<text for="));
-        assert!(!output.contains("transliterations"));
-    }
-
-    #[test]
-    fn filters_latin_only_lines_without_breaking_punctuation_fold() {
-        let input = concat!(
-            r#"<tt><body>"#,
-            r#"<p key="L1">(Ooh) 어리숙하다</p>"#,
-            r#"<p key="L2">Hello</p>"#,
-            r#"</body><head><metadata>"#,
-            r#"<transliterations><transliteration xml:lang="ko-Latn">"#,
-            r#"<text for="L1"><span begin="9.111" end="9.500">(Ooh</span>) "#,
-            r#"<span begin="9.400" end="10.096">eo ri</span></text>"#,
-            r#"<text for="L2">Hello</text>"#,
-            r#"</transliteration></transliterations>"#,
-            r#"</metadata></head></tt>"#
-        );
-
-        let output = move_romanization_to_translation(input);
-
-        assert!(output.contains(r#"<span begin="9.111" end="9.500">(Ooh)</span>"#));
-        assert!(!output.contains(r#"<text for="L2">Hello</text>"#));
     }
 }
